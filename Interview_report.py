@@ -13,6 +13,22 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 
 # ============= RESPONSE MODELS FOR TRANSCRIPT EVALUATOR =============
 
+class SkillEvaluation(BaseModel):
+    """Individual skill evaluation with percentage score"""
+    skill_name: str = Field(description="Name of the skill (e.g., 'Python', 'SQL', 'Communication Skills')")
+    description: str = Field(description="Detailed evaluation of the candidate's proficiency in this skill based on the interview")
+    percentage: int = Field(description="Skill proficiency score out of 100", ge=0, le=100)
+
+
+class QuestionAnalysis(BaseModel):
+    """Analysis of individual question-response pair"""
+    question: str = Field(description="The interview question asked")
+    response_summary: str = Field(description="Summary of the candidate's response to this question")
+    score: int = Field(description="Score for this specific response out of 100", ge=0, le=100)
+    key_insights: List[str] = Field(description="Key positive points, strengths, or good observations from the response (3-5 points)")
+    missed_opportunities: List[str] = Field(description="What the candidate missed or could have improved (2-4 points)")
+
+
 class CategoryScore(BaseModel):
     """Score for each evaluation category - all out of 100"""
     technical_area: int = Field(description="Technical competence score out of 100", ge=0, le=100)
@@ -31,10 +47,13 @@ class AreaForImprovement(BaseModel):
 class InterviewEvaluationResponse(BaseModel):
     """Complete structured response for interview evaluation"""
     overall_score: int = Field(description="Total score out of 100", ge=0, le=100)
+    must_to_have_skills: List[SkillEvaluation] = Field(description="Evaluation of mandatory skills from the job description")
+    good_to_have_skills: List[SkillEvaluation] = Field(description="Evaluation of nice-to-have skills from the job description")
+    interview_questions_responses: List[QuestionAnalysis] = Field(description="Question-wise analysis with scores, insights, and missed opportunities")
     category_scores: CategoryScore
     top_strengths: List[str] = Field(description="Top 3-5 strengths with specific examples from the interview", min_length=3, max_length=5)
     areas_for_improvement: List[AreaForImprovement] = Field(description="List of areas that need improvement (simple list, no severity labels)")
-    recommendation_rationale: str = Field(description="Detailed recommendation rationale in natural human tone, 700-800 words, written like how a real interviewer would provide feedback after an interview")
+    overall_ai_summary: str = Field(description="Overall AI interview summary in approximately 300 words, written in a natural, professional tone like a real interviewer's summary")
 
 
 # ============= MODEL & PROMPT =============
@@ -42,53 +61,67 @@ class InterviewEvaluationResponse(BaseModel):
 model = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.2,
-    max_tokens=3000,
-    request_timeout=40
+    max_tokens=3000
+    # request_timeout=40
 )
 
 EVALUATOR_SYSTEM_PROMPT = """You are an experienced interviewer who has just finished conducting a job interview. You need to provide a comprehensive evaluation of the candidate - exactly like you would write in your interview notes or share with the hiring team.
 
 Your evaluation should feel like it was written by a real human interviewer who paid close attention to the conversation.
 
-SCORING (all out of 100):
+IMPORTANT CONTEXT:
+- You have been provided with MANDATORY SKILLS (Must-to-Have) that are required for this role
+- You have been provided with NICE-TO-HAVE SKILLS (Good-to-Have) that are preferred but not required
+- The EXPERIENCE LEVEL indicates the expected depth for this role
+- Evaluate candidates based on the EXPERIENCE LEVEL provided
 
-1. Technical Area: Assess their technical knowledge, depth of understanding, problem-solving approach, and ability to explain technical concepts clearly. Did they demonstrate genuine expertise or was it surface-level?
+EVALUATION STRUCTURE:
 
-2. Communication Skills: How clearly did they express themselves? Did they structure their answers well? Were they concise or rambling? Could they explain complex things simply? Did they listen well and answer what was actually asked?
+1. MUST-TO-HAVE SKILLS EVALUATION:
+   - Evaluate EACH mandatory skill from the provided list
+   - For each skill, provide:
+     * skill_name: Exact name of the skill
+     * description: Detailed assessment of candidate's proficiency based ONLY on interview responses. What did they demonstrate? What was missing? Reference specific quotes or examples from the transcript.
+     * percentage: Score 0-100 based on demonstrated proficiency relative to the experience level
+   - Be thorough and reference actual interview content
 
-3. Project Experience/Expertise: How substantial and relevant is their actual project experience? Did they provide specific examples with real outcomes? Could they speak authentically about their contributions? Was there depth in their project discussions?
+2. GOOD-TO-HAVE SKILLS EVALUATION:
+   - Evaluate EACH nice-to-have skill from the provided list
+   - Same structure as above: skill_name, description, percentage
+   - These are bonus skills - lower scores are acceptable if candidate demonstrates strong mandatory skills
 
-4. Behavioral Fit: How well would they fit the team and culture? Did they demonstrate teamwork, adaptability, ownership, accountability? How did they handle questions about challenges, conflicts, or failures?
+3. QUESTION-WISE ANALYSIS:
+   For EACH question-response pair in the transcript, provide:
+   - question: The exact question asked
+   - response_summary: Concise summary of what the candidate said
+   - score: 0-100 based on quality, depth, and relevance of the response
+   - key_insights: 3-5 positive points - what did they do well? What stood out? Specific strengths demonstrated
+   - missed_opportunities: 2-4 points - what could they have added? What details were missing? What would have made this answer stronger?
 
-5. Critical Thinking: Did they show logical reasoning? Could they discuss trade-offs? Did they think through problems systematically? Could they handle "what if" scenarios thoughtfully?
+4. CATEGORY SCORES (all out of 100):
+   - Technical Area: Technical knowledge, depth, problem-solving approach, clarity in explaining concepts
+   - Communication Skills: Clarity, structure, conciseness, ability to explain complex things simply
+   - Project Experience: Substantiality of experience, specific examples with outcomes, authenticity
+   - Behavioral Fit: Team fit, adaptability, ownership, accountability, handling of challenges/conflicts
+   - Critical Thinking: Logical reasoning, trade-off discussions, systematic problem solving
 
-AREAS FOR IMPROVEMENT:
-- Create a simple list (no severity labels like "critical" or "minor")
-- Focus on genuine gaps or concerns based on their actual responses
-- Be fair and specific - reference what they said that indicates the need for improvement
-- Only list real issues, not nitpicks
+5. AREAS FOR IMPROVEMENT:
+   - Simple list (no severity labels)
+   - Focus on genuine gaps based on actual responses
+   - Be fair and specific
 
-TOP STRENGTHS:
-- Identify 3-5 genuine strengths based on their interview performance
-- Reference specific things they said or demonstrated
-- Be authentic - not every candidate has 5 strengths, but most have at least 2-3
+6. TOP STRENGTHS:
+   - 3-5 genuine strengths with specific examples from the interview
 
-FINAL RECOMMENDATION RATIONALE (700-800 words):
-This is the most important part. Write it like a real interviewer providing thoughtful feedback to the hiring manager. Use a natural, conversational human tone.
-
-Structure your rationale like this:
-
-1. OPENING (50-100 words): Start with your overall impression. "Having interviewed [candidate name] for [position], I came away with..." or "My conversation with [candidate] left me feeling..."
-
-2. TECHNICAL ASSESSMENT (150-200 words): Discuss their technical capabilities naturally. "When we dug into [specific topic], I was impressed by..." or "I had some concerns when they couldn't explain..." Reference actual exchanges from the interview.
-
-3. EXPERIENCE & EXPERTISE (100-150 words): Talk about their project experience authentically. "Their work on [project] stood out because..." or "I struggled to get concrete details about..." Mention what felt genuine vs. what felt exaggerated.
-
-4. COMMUNICATION & PRESENCE (100-150 words): Describe how they came across. "They communicated with confidence and clarity when..." or "I noticed they tended to ramble when..." Be honest about how they would present to stakeholders or clients.
-
-5. BEHAVIORAL/CULTURAL FIT (100-150 words): Discuss team fit. "I could see them fitting in well because..." or "I have some concerns about..." Reference behavioral questions and their responses.
-
-6. CLOSING & RECOMMENDATION (100-150 words): Sum up with a clear hiring recommendation. "Overall, I would [recommend/not recommend] moving forward because..." Be decisive but nuanced.
+7. OVERALL AI SUMMARY (approximately 300 words):
+   Write a natural, professional summary like a real interviewer would provide. Include:
+   - Overall impression of the candidate
+   - Technical capability highlights and concerns
+   - Communication style and clarity
+   - Fit for the role based on mandatory skills
+   - Key strengths that stood out
+   - Significant gaps or concerns
+   - Final hiring recommendation (hire/no hire/maybe)
 
 Write like you're talking to a colleague - not like a robot scoring an exam. Use phrases like:
 - "What stood out to me was..."
@@ -102,15 +135,23 @@ BASE YOUR EVALUATION ONLY ON WHAT WAS SAID IN THE INTERVIEW TRANSCRIPT. Do not a
 
 # ============= EVALUATOR FUNCTION =============
 
-async def evaluate_interview_transcript(transcript: str) -> InterviewEvaluationResponse:
+async def evaluate_interview_transcript(
+    transcript_data: str,
+    experience: str,
+    mandatory_skills: str,
+    nice_to_have_skills: str
+) -> InterviewEvaluationResponse:
     """
     Evaluate interview transcript and provide comprehensive assessment
-    
+
     Args:
-        transcript: Full interview transcript with Q&A pairs
-        
+        transcript_data: Full interview transcript with Q&A pairs
+        experience: Required experience level (e.g., "4+ years", "Senior", "Mid-level")
+        mandatory_skills: Skills that are required for the role
+        nice_to_have_skills: Bonus skills that are preferred but not required
+
     Returns:
-        InterviewEvaluationResponse with scores, mistakes, and recommendation
+        InterviewEvaluationResponse with skills evaluation, question analysis, scores, and summary
     """
     agent = create_agent(
         model,
@@ -118,11 +159,22 @@ async def evaluate_interview_transcript(transcript: str) -> InterviewEvaluationR
         system_prompt=EVALUATOR_SYSTEM_PROMPT
     )
 
-    context_message = f"""Interview Transcript:
+    context_message = f"""INTERVIEW TRANSCRIPT:
+{transcript_data}
 
-{transcript}
+JOB REQUIREMENTS:
 
-Analyze this interview and provide comprehensive evaluation."""
+EXPECTED EXPERIENCE LEVEL:
+{experience}
+
+MANDATORY SKILLS (Must-to-Have - Critical for this role):
+{mandatory_skills}
+
+NICE-TO-HAVE SKILLS (Good-to-Have - Preferred but not required):
+{nice_to_have_skills}
+
+Analyze this interview comprehensively. Evaluate each mandatory skill, each nice-to-have skill,
+analyze each question-response pair, and provide an overall assessment."""
     
     result = agent.invoke(
         {"messages": [{"role": "user", "content": context_message}]}
@@ -151,9 +203,27 @@ Analyze this interview and provide comprehensive evaluation."""
 # Q5: Can you walk through your approach to debugging a production issue?
 # A: I check the logs, see what's wrong, and fix it. Pretty straightforward.
 # """
-    
+
+#     # Job requirements
+#     experience = "4+ years"
+#     mandatory_skills = """• Python development for AI/backend applications
+# • Generative AI and LLMs (GPT-4, Claude, etc.)
+# • LangChain or similar frameworks
+# • Pandas and NumPy for data manipulation
+# • AWS AI/ML services (Lambda, SageMaker, S3)"""
+
+#     nice_to_have_skills = """• CI/CD pipelines and GitHub
+# • Docker and containerization
+# • Vector databases (Pinecone, FAISS, Chroma)
+# • MLOps practices"""
+
 #     # Evaluate transcript
-#     evaluation = await evaluate_interview_transcript(sample_transcript)
+#     evaluation = await evaluate_interview_transcript(
+#         transcript_data=sample_transcript,
+#         experience=experience,
+#         mandatory_skills=mandatory_skills,
+#         nice_to_have_skills=nice_to_have_skills
+#     )
 #     print(evaluation)
 
 #     # Print formatted results
@@ -161,6 +231,31 @@ Analyze this interview and provide comprehensive evaluation."""
 #     print(f"INTERVIEW EVALUATION REPORT")
 #     print(f"{'='*60}")
 #     print(f"\nOVERALL SCORE: {evaluation.overall_score}/100")
+
+#     print(f"\n{'='*60}")
+#     print("MUST-TO-HAVE SKILLS")
+#     print(f"{'='*60}")
+#     for skill in evaluation.must_to_have_skills:
+#         print(f"\n{skill.skill_name}: {skill.percentage}%")
+#         print(f"  {skill.description}")
+
+#     print(f"\n{'='*60}")
+#     print("GOOD-TO-HAVE SKILLS")
+#     print(f"{'='*60}")
+#     for skill in evaluation.good_to_have_skills:
+#         print(f"\n{skill.skill_name}: {skill.percentage}%")
+#         print(f"  {skill.description}")
+
+#     print(f"\n{'='*60}")
+#     print("QUESTION-WISE ANALYSIS")
+#     print(f"{'='*60}")
+#     for i, qa in enumerate(evaluation.interview_questions_responses, 1):
+#         print(f"\nQ{i}: {qa.question[:80]}...")
+#         print(f"Score: {qa.score}/100")
+#         print(f"Summary: {qa.response_summary}")
+#         print(f"Key Insights: {', '.join(qa.key_insights[:2])}")
+#         print(f"Missed: {', '.join(qa.missed_opportunities[:2])}")
+
 #     print(f"\n--- CATEGORY SCORES ---")
 #     print(f"Technical Area:        {evaluation.category_scores.technical_area}/100")
 #     print(f"Communication Skills:  {evaluation.category_scores.communication_skills}/100")
@@ -178,9 +273,9 @@ Analyze this interview and provide comprehensive evaluation."""
 #         print(f"  {area.description}")
 
 #     print(f"\n{'='*60}")
-#     print("FINAL RECOMMENDATION RATIONALE")
+#     print("OVERALL AI SUMMARY")
 #     print(f"{'='*60}")
-#     print(evaluation.recommendation_rationale)
+#     print(evaluation.overall_ai_summary)
 
 
 # if __name__ == "__main__":

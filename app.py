@@ -67,6 +67,7 @@ class ProcessTextResponse(BaseModel):
     file_size: int
     content_preview: Optional[str] = None
     response: Optional[dict] = None
+    user_id: str
 
 
 class ErrorResponse(BaseModel):
@@ -143,7 +144,27 @@ async def process_pdf_with_jd(
         description="Job Description text",
         min_length=1,
         max_length=10000
-    )
+    ),
+    Experience: str = Form(
+        ...,
+        description="Experience text",
+        min_length=1,
+        max_length=10000
+    ),
+    Mandatory_skills: str = Form(
+        ...,
+        description="Mandatory skills text",
+        min_length=1,
+        max_length=10000
+    ),
+    Nice_to_have_skills: str = Form(
+        ...,
+        description="Nice to have skills text",
+        min_length=1,
+        max_length=10000
+    ),
+
+
 ) -> ProcessPDFResponse:
     """
     Endpoint to process a PDF file along with job description text.
@@ -187,7 +208,7 @@ async def process_pdf_with_jd(
         data = await extract_text_from_pdf(temp_file_path)
 
         # Generate interview questions
-        result = await interview_question(data, jd_text)
+        result = await interview_question(data, jd_text,Experience,Mandatory_skills,Nice_to_have_skills)
 
         # Clean up temp file
         os.remove(temp_file_path)
@@ -229,7 +250,31 @@ async def process_text_file(
         ...,
         description="Text file to be processed",
         media_type="text/plain"
-    )
+    ),
+    Experience: str = Form(
+        ...,
+        description="Experience text",
+        min_length=1,
+        max_length=10000
+    ),
+    Mandatory_skills: str = Form(
+        ...,
+        description="Mandatory skills text",
+        min_length=1,
+        max_length=10000
+    ),
+    Nice_to_have_skills: str = Form(
+        ...,
+        description="Nice to have skills text",
+        min_length=1,
+        max_length=10000
+    ),
+    user_id: str = Form(
+        ...,
+        description="user id text",
+        min_length=1,
+        max_length=10000
+    )   
 ) -> ProcessTextResponse:
     """
     Endpoint to process a text file.
@@ -251,7 +296,7 @@ async def process_text_file(
         file_size = len(content_bytes)
 
         # Evaluate interview transcript using the content string
-        result = await evaluate_interview_transcript(content)
+        result = await evaluate_interview_transcript(content,Experience,Mandatory_skills,Nice_to_have_skills)
 
         # Log the processing
         logger.info(
@@ -263,6 +308,7 @@ async def process_text_file(
 
         return ProcessTextResponse(
             success=True,
+            user_id = user_id,
             message="Text file processed successfully",
             file_name=text_file.filename,
             file_size=file_size,

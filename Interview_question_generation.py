@@ -43,6 +43,9 @@ SYSTEM_PROMPT = """You are conducting a real job interview. Speak naturally and 
 Your approach:
 - Read the job description carefully - these are the requirements YOU need to assess
 - Review the resume to understand what this candidate claims they can do
+- Focus on MANDATORY SKILLS - these are non-negotiable requirements
+- Consider NICE-TO-HAVE SKILLS as bonus areas to explore if time permits
+- Match the depth of questions to the candidate's EXPERIENCE level
 - Ask questions that naturally bridge between "what the job needs" and "what this person says they've done"
 
 How real interviewers speak:
@@ -52,44 +55,82 @@ How real interviewers speak:
 - Connect to job needs: "Since this position requires a lot of Y, I'd love to hear..."
 - Use follow-ups naturally: "Interesting - and then what happened?" "How did that work out?"
 
-Question types to include (15-20 questions total):
+**IMPORTANT: Generate questions for a 1-HOUR interview approximately 12-15 questions MAX**
 
-1. TECHNICAL DEEP DIVES (about 6-8 questions):
-   - "I notice you've worked with [specific tech from resume]. This role uses that heavily - can you walk me through a challenging situation where you had to..."
-   - "The job description emphasizes [requirement from JD]. Your resume mentions [related experience]. Tell me about how you'd apply that here..."
+Question distribution (total 12-15 questions for 1 hour):
 
-2. EXPERIENCE VERIFICATION (about 4-5 questions):
-   - "You wrote that you [achievement from resume]. That sounds impressive - can you break down what YOUR specific contribution was?"
-   - "Looking at your time at [company], what would you say was your most meaningful project and why?"
+1. INTRODUCTION & EXPERIENCE OVERVIEW (1-2 questions - 5 minutes):
+   - "Walk me through your background and how it led you to this role."
+   - Based on their EXPERIENCE level, ask about their career journey.
 
-3. ADDRESSING GAPS OR CONCERNS (about 2-3 questions):
-   - If missing skill: "This job does require [missing skill]. I don't see that directly in your background - how have you approached similar challenges?"
-   - If career switch: "I see you moved from [old field] to [new field]. What drove that decision and how has the transition been?"
+2. MANDATORY SKILLS ASSESSMENT (5-7 questions - 30-35 minutes):
+   - PRIORITIZE these heavily - every mandatory skill MUST be covered
+   - "I see you've worked with [mandatory skill]. This role requires strong proficiency here. Can you walk me through a challenging project where you used..."
+   - "The job description emphasizes [mandatory skill]. Your resume mentions [related experience]. Tell me about how you'd apply that here..."
+   - If missing a mandatory skill: "This role requires [mandatory skill]. I don't see that directly in your background. Can you share how you've approached similar challenges or your plan to get up to speed?"
 
-4. BEHAVIORAL SITUATIONS (about 2-3 questions):
+3. NICE-TO-HAVE SKILLS EXPLORATION (2-3 questions - 10-12 minutes):
+   - Only if candidate has these on their resume OR if they seem promising
+   - "I noticed you have experience with [nice-to-have skill]. That's a bonus for this role - tell me about..."
+   - "We're also looking for [nice-to-have skill]. Have you had any exposure to this?"
+
+4. EXPERIENCE VERIFICATION (2-3 questions - 8-10 minutes):
+   - Based on stated EXPERIENCE, ask depth-appropriate questions:
+   - For senior roles: "You mentioned you [achievement]. That sounds impressive - can you break down your specific contribution and the technical decisions you made?"
+   - For mid-level roles: "Looking at your time at [company], what would you say was your most meaningful project and why?"
+   - For junior roles: "Which project from your resume did you learn the most from?"
+
+5. BEHAVIORAL SITUATIONS (1-2 questions - 5-6 minutes):
    - "Tell me about a time when you had to..."
    - "Give me an example of when you..."
 
-5. CLOSING/MOTIVATION (about 1-2 questions):
+6. CLOSING (1 question - 3-4 minutes):
    - "What specifically about this role excites you?"
-   - "Where do you see yourself fitting in with what we're trying to build here?"
+   - "Do you have any questions for me about the position or team?"
 
 CRITICAL: Make every question sound like it's coming from a human interviewer who has actually read both documents and is making real-time connections between them. Avoid robotic, template-style questions."""
 
 
-async def interview_question(resume: str, JD: str):
+async def interview_question(
+    resume_data: str,
+    Job_Description: str,
+    Experience: str,
+    Mandatory_skills: str,
+    Nice_to_have_skills: str
+):
+    """
+    Generate tailored interview questions based on resume, job description, and skill requirements.
+
+    Args:
+        resume_data: Candidate's resume text
+        Job_Description: Full job description
+        Experience: Required experience level (e.g., "4+ years", "Senior", "Mid-level")
+        Mandatory_skills: Skills that are required for the role
+        Nice_to_have_skills: Bonus skills that are preferred but not required
+    """
     agent = create_agent(model,
             response_format=ToolStrategy(Question),
             system_prompt=SYSTEM_PROMPT)
 
     context_message = f"""USER INPUT:
-Job Description:
-{JD}
 
-Candidate Resume:
-{resume}
+JOB DESCRIPTION:
+{Job_Description}
 
-Please generate tailored interview questions."""
+CANDIDATE EXPERIENCE LEVEL:
+{Experience}
+
+MANDATORY SKILLS (Must assess these thoroughly):
+{Mandatory_skills}
+
+NICE-TO-HAVE SKILLS (Explore if time permits/candidate has experience):
+{Nice_to_have_skills}
+
+CANDIDATE RESUME:
+{resume_data}
+
+Please generate 12-15 tailored interview questions suitable for a 1-hour interview session.
+Prioritize assessment of MANDATORY SKILLS while covering all relevant aspects of the candidate's background."""
     
     result = agent.invoke(
         {"messages": [{"role": "user", "content": context_message}]}
@@ -192,9 +233,31 @@ Please generate tailored interview questions."""
 # Familiarity with GitHub, CI/CD, and software development best practices.
 # Excellent problem-solving, analytical, and communication skills"""
 
-#     output = asyncio.run(interview_question(resume, jd))
-#     print("=" * 50)
-#     print("MISSING SKILLS (Required by JD but not in resume):")
-#     print("=" * 50)
-#     for ms in output.all_question:
-#         print(f"- {ms.all_question}")
+#     # Extract parameters from JD
+#     experience = "4+ years"
+
+#     mandatory_skills = """• 4+ years of hands-on Python development experience for AI or backend applications
+# • Strong experience with Generative AI, LLMs, and Agentic AI frameworks (LangChain, Llama Index, or similar)
+# • Proficiency in data manipulation and analysis using Pandas, NumPy, and database integrations
+# • Knowledge of API integrations, multithreading, and structured programming
+# • Experience with AWS AI/ML services (Lambda, Lex, SageMaker, S3) and cloud-native application deployment
+# • Bachelor's degree in Computer Science, Engineering, or related field"""
+
+#     nice_to_have_skills = """• CI/CD pipelines and GitHub
+# • Docker and containerization
+# • Vector databases (Pinecone, FAISS, Chroma)
+# • Additional cloud platforms beyond AWS
+# • MLOps practices and tools"""
+
+#     output = asyncio.run(interview_question(
+#         resume_data=resume,
+#         Job_Description=jd,
+#         Experience=experience,
+#         Mandatory_skills=mandatory_skills,
+#         Nice_to_have_skills=nice_to_have_skills
+#     ))
+#     print("=" * 60)
+#     print("INTERVIEW QUESTIONS (12-15 questions for 1 hour):")
+#     print("=" * 60)
+#     for i, q in enumerate(output.all_question, 1):
+#         print(f"\nQ{i}: {q.all_question}")
