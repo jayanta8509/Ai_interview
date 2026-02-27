@@ -3,19 +3,18 @@ FastAPI Application with two endpoints for file processing.
 Production-ready with proper validation, error handling, and security features.
 """
 
-# import imp
 import os
+import json
 import logging
 from typing import Optional
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, status
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field
-from urllib3 import request
-from Interview_question_generation import extract_text_from_pdf,interview_question
+from pydantic import BaseModel, field_validator
+from Interview_question_generation import extract_text_from_pdf, interview_question
 from Interview_report import evaluate_interview_transcript
 
 
@@ -25,6 +24,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ============= EXTERNAL API =============
+EXTERNAL_API_URL = "https://aiinterviewagent.bestworks.cloud/analysis/ai/"
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -38,7 +40,7 @@ app = FastAPI(
 # Production middleware configurations
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,11 +48,12 @@ app.add_middleware(
 
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*"]  # Configure appropriately for production
+    allowed_hosts=["*"]
 )
 
 
-# Pydantic models for request/response
+# ============= PYDANTIC MODELS =============
+
 class ProcessPDFResponse(BaseModel):
     success: bool
     message: str
@@ -61,13 +64,35 @@ class ProcessPDFResponse(BaseModel):
 
 
 class ProcessTextResponse(BaseModel):
-    success: bool
-    message: str
-    file_name: str
-    file_size: int
-    content_preview: Optional[str] = None
-    response: Optional[dict] = None
-    user_id: str
+    token: str
+    analysis: Optional[dict] = None
+
+    @field_validator("analysis", mode="before")
+    @classmethod
+    def parse_analysis(cls, v):
+        """
+        Handles 3 possible cases:
+        1. Already a dict        → return as-is
+        2. A JSON string         → parse and return dict
+        3. A Pydantic model      → call .model_dump()
+        """
+        if v is None:
+            return v
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                cleaned = v.strip()
+                if cleaned.startswith("```"):
+                    cleaned = cleaned.split("```")[1]
+                    if cleaned.startswith("json"):
+                        cleaned = cleaned[4:]
+                return json.loads(cleaned.strip())
+            except json.JSONDecodeError as e:
+                raise ValueError(f"analysis string is not valid JSON: {e}")
+        if hasattr(v, "model_dump"):
+            return v.model_dump()
+        raise ValueError(f"Cannot convert analysis of type {type(v)} to dict")
 
 
 class ErrorResponse(BaseModel):
@@ -76,13 +101,15 @@ class ErrorResponse(BaseModel):
     detail: Optional[str] = None
 
 
-# Allowed file extensions
+# ============= CONSTANTS =============
+
 ALLOWED_PDF_EXTENSIONS = {".pdf"}
-ALLOWED_TEXT_EXTENSIONS = {".txt", ".text"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 
-def validate_file_size(file: UploadFile, max_size: int = MAX_FILE_SIZE) -> None:
+# ============= HELPERS =============
+
+def validate_file_size(file, max_size: int = MAX_FILE_SIZE) -> None:
     """Validate file size before processing."""
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
@@ -109,6 +136,49 @@ def validate_file_extension(filename: str, allowed_extensions: set) -> None:
             detail=f"Invalid file type. Allowed types: {', '.join(allowed_extensions)}"
         )
 
+
+async def forward_to_external_api(token: str, analysis: dict):
+    """
+    Forwards the evaluation result to the external API endpoint.
+    Payload: { "token": "...", "analysis": { ... } }
+    """
+    payload = {
+        "token": token,
+        "analysis": json.dumps(analysis)  # Java backend expects analysis as a JSON string
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                EXTERNAL_API_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            logger.info(f"External API call successful: status={response.status_code}")
+            return response.json()
+
+    except httpx.TimeoutException:
+        logger.error("External API call timed out")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="External API timed out"
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"External API returned error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"External API error: {e.response.status_code} - {e.response.text}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error calling external API: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to reach external API: {str(e)}"
+        )
+
+
+# ============= ENDPOINTS =============
 
 @app.get("/", tags=["Health"])
 async def root():
@@ -163,8 +233,6 @@ async def process_pdf_with_jd(
         min_length=1,
         max_length=10000
     ),
-
-
 ) -> ProcessPDFResponse:
     """
     Endpoint to process a PDF file along with job description text.
@@ -175,42 +243,28 @@ async def process_pdf_with_jd(
     Returns processing status and metadata.
     """
     try:
-        # Validate PDF file extension
         validate_file_extension(pdf_file.filename, ALLOWED_PDF_EXTENSIONS)
-
-        # Validate file size
         validate_file_size(pdf_file.file)
 
-        # Read file content (for demonstration)
         content = await pdf_file.read()
         file_size = len(content)
 
-        # Log the processing
         logger.info(
             f"Processing PDF: {pdf_file.filename}, "
             f"Size: {file_size} bytes, "
             f"JD length: {len(jd_text)} characters"
         )
 
-        # TODO: Add your actual PDF processing logic here
-        # Example: extract text from PDF, match with JD, etc.
-
-        # Save uploaded file to temp directory for processing
         temp_dir = "temp_uploads"
         os.makedirs(temp_dir, exist_ok=True)
         temp_file_path = os.path.join(temp_dir, pdf_file.filename)
 
-        # Write the uploaded file to disk
         with open(temp_file_path, "wb") as temp_file:
             temp_file.write(content)
 
-        # Extract text from PDF using the file path
         data = await extract_text_from_pdf(temp_file_path)
+        result = await interview_question(data, jd_text, Experience, Mandatory_skills, Nice_to_have_skills)
 
-        # Generate interview questions
-        result = await interview_question(data, jd_text,Experience,Mandatory_skills,Nice_to_have_skills)
-
-        # Clean up temp file
         os.remove(temp_file_path)
 
         return ProcessPDFResponse(
@@ -219,7 +273,7 @@ async def process_pdf_with_jd(
             file_name=pdf_file.filename,
             file_size=file_size,
             jd_length=len(jd_text),
-            response= [question.all_question for question in result.all_question]
+            response=[question.all_question for question in result.all_question]
         )
 
     except HTTPException:
@@ -239,17 +293,20 @@ async def process_pdf_with_jd(
         400: {"model": ErrorResponse, "description": "Bad Request"},
         413: {"model": ErrorResponse, "description": "Payload Too Large"},
         415: {"model": ErrorResponse, "description": "Unsupported Media Type"},
-        422: {"model": ErrorResponse, "description": "Validation Error"}
+        422: {"model": ErrorResponse, "description": "Validation Error"},
+        502: {"model": ErrorResponse, "description": "External API Error"},
+        504: {"model": ErrorResponse, "description": "External API Timeout"},
     },
     tags=["Text Processing"],
     summary="Process Text File",
     description="Upload a text file for processing"
 )
 async def process_text_file(
-    text_file: UploadFile = File(
+    text: str = Form(
         ...,
-        description="Text file to be processed",
-        media_type="text/plain"
+        description="Transcript text",
+        min_length=1,
+        max_length=100000
     ),
     Experience: str = Form(
         ...,
@@ -271,48 +328,49 @@ async def process_text_file(
     ),
     user_id: str = Form(
         ...,
-        description="user id text",
+        description="User id text",
         min_length=1,
         max_length=10000
-    )   
+    )
 ) -> ProcessTextResponse:
     """
-    Endpoint to process a text file.
+    Endpoint to process a transcript text.
 
-    - **text_file**: Text file upload (.txt or .text) (required)
+    - **text**: Interview transcript text (required)
+    - **Experience**: Experience level (required)
+    - **Mandatory_skills**: Must-have skills (required)
+    - **Nice_to_have_skills**: Preferred skills (required)
+    - **user_id**: User identifier returned as token (required)
 
-    Returns processing status and content preview.
+    Returns evaluation result and forwards it to the external API.
     """
     try:
-        # Validate text file extension
-        validate_file_extension(text_file.filename, ALLOWED_TEXT_EXTENSIONS)
-
-        # Validate file size
-        validate_file_size(text_file.file)
-
-        # Read file content
-        content_bytes = await text_file.read()
-        content = content_bytes.decode('utf-8')
-        file_size = len(content_bytes)
-
-        # Evaluate interview transcript using the content string
-        result = await evaluate_interview_transcript(content,Experience,Mandatory_skills,Nice_to_have_skills)
-
-        # Log the processing
-        logger.info(
-            f"Processing text file: {text_file.filename}, "
-            f"Size: {file_size} bytes"
+        # Step 1: Evaluate the transcript
+        result = await evaluate_interview_transcript(
+            text,
+            Experience,
+            Mandatory_skills,
+            Nice_to_have_skills
         )
 
-        # TODO: Add your actual text processing logic here
+        # Step 2: Normalize result to a clean dict
+        if hasattr(result, "model_dump"):
+            analysis_data = result.model_dump()
+        elif isinstance(result, dict):
+            analysis_data = result
+        else:
+            analysis_data = result  # validator will handle conversion
 
+        # Step 3: Forward result to external API
+        await forward_to_external_api(
+            token=user_id,
+            analysis=analysis_data
+        )
+
+        # Step 4: Return same response back to caller
         return ProcessTextResponse(
-            success=True,
-            user_id = user_id,
-            message="Text file processed successfully",
-            file_name=text_file.filename,
-            file_size=file_size,
-            response=result.model_dump() if result else None
+            token=user_id,
+            analysis=analysis_data
         )
 
     except UnicodeDecodeError:
@@ -343,12 +401,11 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    # Run the application
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
         port=8004,
-        reload=True,  # Set to False in production
+        reload=True,
         log_level="info",
         access_log=True
     )
