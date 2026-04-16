@@ -1,263 +1,248 @@
+"""
+Interview Question Generation Module
+-------------------------------------
+Generates calibrated interview questions based on:
+  - Candidate's resume
+  - Job description (including company context)
+  - Required experience level
+  - Mandatory and nice-to-have skills
+
+FIXES APPLIED:
+  1. Replaced synchronous create_agent().invoke() (which blocks the async event
+     loop) with model.with_structured_output() + asyncio.to_thread() — the
+     correct async-safe pattern for LangChain structured output.
+  2. Completely rewrote SYSTEM_PROMPT with explicit, rules-based calibration:
+       - Experience tier -> question depth/complexity matrix
+       - Company-type detection from JD -> interview style/culture calibration
+       - Mandatory vs nice-to-have skill weighting
+  3. Restructured context_message so the LLM sees calibration directives FIRST,
+     before the content — higher priority parsing.
+"""
+
 import os
 import asyncio
-import json
-from re import S
-import fitz
-from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI
-from pydantic import BaseModel , Field
-from langchain.agents.structured_output import ToolStrategy
+
+import fitz  # PyMuPDF
+from langchain_core.messages import SystemMessage, HumanMessage
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv()
-openai_api_key = os.getenv("OPENAI_API_KEY")
+from langchain_openai import ChatOpenAI
 
+
+# ----------------------------------------------------------
+#  Pydantic models for structured LLM output
+# ----------------------------------------------------------
 
 class question(BaseModel):
-    all_question: str= Field(description="The interview question")
+    all_question: str = Field(description="A single interview question")
+
 
 class Question(BaseModel):
-    all_question: list[question]
+    all_question: list[question] = Field(
+        description="List of 12-15 calibrated interview questions"
+    )
 
 
+# ----------------------------------------------------------
+#  PDF extraction
+# ----------------------------------------------------------
 
-async def extract_text_from_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    doc.close()
-    return text
-# OPTIMIZATION 1: Use faster model with optimized parameters
-model = ChatOpenAI(
-    model="gpt-4o-mini",  # Much faster than gpt-5-mini
-    # # temperature=0.1,        # very low for deterministic output
-    # max_tokens=800,    # Set explicit limit to prevent over-generation
-    # request_timeout=25,           # Add timeout to prevent hanging
-    # # streaming=False,      # Disable streaming for batch processing
-    # # max_retries=2
+async def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extract plain text from every page of a PDF."""
+    def _extract():
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        return text
+
+    return await asyncio.to_thread(_extract)
+
+
+# ----------------------------------------------------------
+#  LLM — gpt-4o-mini with structured output
+# ----------------------------------------------------------
+
+_model = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.4,  # slight creativity while staying focused
 )
 
-SYSTEM_PROMPT = """You are conducting a real job interview. Speak naturally and conversationally - exactly how a professional interviewer would talk to a candidate face-to-face.
+# Bind the structured output schema once; reuse across all requests
+_structured_model = _model.with_structured_output(Question)
 
-Your approach:
-- Read the job description carefully - these are the requirements YOU need to assess
-- Review the resume to understand what this candidate claims they can do
-- Focus on MANDATORY SKILLS - these are non-negotiable requirements
-- Consider NICE-TO-HAVE SKILLS as bonus areas to explore if time permits
-- Match the depth of questions to the candidate's EXPERIENCE level
-- Ask questions that naturally bridge between "what the job needs" and "what this person says they've done"
 
-How real interviewers speak:
-- Start with context: "I see on your resume..." or "This role really needs..." or "Looking at your background..."
-- Be conversational: "Tell me about..." "Walk me through..." "How did you handle..." "What was your approach to..."
-- Reference specific resume claims: "You mentioned you built X - can you elaborate on..."
-- Connect to job needs: "Since this position requires a lot of Y, I'd love to hear..."
-- Use follow-ups naturally: "Interesting - and then what happened?" "How did that work out?"
+# ----------------------------------------------------------
+#  System prompt with explicit calibration rules
+# ----------------------------------------------------------
 
-**IMPORTANT: Generate questions for a 1-HOUR interview approximately 12-15 questions MAX**
+SYSTEM_PROMPT = """
+You are a senior technical interviewer generating a set of calibrated interview questions.
+Your primary job is NOT to ask generic questions. It is to craft questions that match
+the EXACT LEVEL of this candidate for THIS specific company and role.
 
-Question distribution (total 12-15 questions for 1 hour):
+=================================================================
+ STEP 1 -- DETERMINE THE EXPERIENCE TIER
+=================================================================
+Read the EXPERIENCE field in the user message and classify the candidate:
 
-1. INTRODUCTION & EXPERIENCE OVERVIEW (1-2 questions - 5 minutes):
-   - "Walk me through your background and how it led you to this role."
-   - Based on their EXPERIENCE level, ask about their career journey.
+  TIER 1 -- JUNIOR (0-2 years / fresher / intern / entry-level)
+    - Focus on: fundamentals, conceptual understanding, learning ability
+    - Depth: "What is X?", "How does X work?", "Have you used X?"
+    - Avoid: system design, architecture decisions, team leadership topics
 
-2. MANDATORY SKILLS ASSESSMENT (5-7 questions - 30-35 minutes):
-   - PRIORITIZE these heavily - every mandatory skill MUST be covered
-   - "I see you've worked with [mandatory skill]. This role requires strong proficiency here. Can you walk me through a challenging project where you used..."
-   - "The job description emphasizes [mandatory skill]. Your resume mentions [related experience]. Tell me about how you'd apply that here..."
-   - If missing a mandatory skill: "This role requires [mandatory skill]. I don't see that directly in your background. Can you share how you've approached similar challenges or your plan to get up to speed?"
+  TIER 2 -- MID-LEVEL (2-5 years / associate / software engineer II)
+    - Focus on: ownership, debugging, feature delivery, trade-off awareness
+    - Depth: "Walk me through how you built X", "What would you do differently?"
+    - Include: some design questions, cross-team collaboration scenarios
 
-3. NICE-TO-HAVE SKILLS EXPLORATION (2-3 questions - 10-12 minutes):
-   - Only if candidate has these on their resume OR if they seem promising
-   - "I noticed you have experience with [nice-to-have skill]. That's a bonus for this role - tell me about..."
-   - "We're also looking for [nice-to-have skill]. Have you had any exposure to this?"
+  TIER 3 -- SENIOR (5-10 years / senior / lead / staff)
+    - Focus on: architecture, scale, technical leadership, mentorship impact
+    - Depth: "Design a system that...", "How would you migrate X to Y at scale?"
+    - Include: system design, org-level decisions, technical strategy
 
-4. EXPERIENCE VERIFICATION (2-3 questions - 8-10 minutes):
-   - Based on stated EXPERIENCE, ask depth-appropriate questions:
-   - For senior roles: "You mentioned you [achievement]. That sounds impressive - can you break down your specific contribution and the technical decisions you made?"
-   - For mid-level roles: "Looking at your time at [company], what would you say was your most meaningful project and why?"
-   - For junior roles: "Which project from your resume did you learn the most from?"
+  TIER 4 -- PRINCIPAL / DIRECTOR / VP (10+ years / staff+ / principal / director)
+    - Focus on: org-wide strategy, cross-functional influence, build-vs-buy decisions
+    - Depth: "How would you align an engineering roadmap with business goals?"
+    - Include: platform strategy, technical vision, stakeholder management
 
-5. BEHAVIORAL SITUATIONS (1-2 questions - 5-6 minutes):
-   - "Tell me about a time when you had to..."
-   - "Give me an example of when you..."
+IF EXPERIENCE IS AMBIGUOUS OR NOT PROVIDED -- infer tier from the resume's highest role title and total years.
 
-6. CLOSING (1 question - 3-4 minutes):
-   - "What specifically about this role excites you?"
-   - "Do you have any questions for me about the position or team?"
+=================================================================
+ STEP 2 -- DETERMINE COMPANY TYPE FROM THE JD
+=================================================================
+Read the JD carefully. Infer the company type and calibrate question style:
 
-CRITICAL: Make every question sound like it's coming from a human interviewer who has actually read both documents and is making real-time connections between them. Avoid robotic, template-style questions."""
+  STARTUP / EARLY-STAGE
+    - Signals: "fast-paced", "wear many hats", "ownership", "early team", "Series A/B"
+    - Style: practical, breadth-first, "how would you build X from scratch with limited resources?",
+             emphasize initiative and adaptability, less process / more execution
 
+  MID-SIZE TECH COMPANY
+    - Signals: "growing team", "scale", "cross-functional", moderate headcount
+    - Style: balance of depth and breadth, process maturity, team collaboration,
+             some system design at appropriate tier
+
+  LARGE ENTERPRISE / FAANG-TIER
+    - Signals: well-known brand, "at scale", "millions of users", "distributed systems",
+               structured interviews, "bar raiser"
+    - Style: deep system design (Tier 3+), coding depth, behavioral STAR format,
+             "tell me about a time you influenced without authority"
+
+  TRADITIONAL / NON-TECH INDUSTRY (finance, healthcare, manufacturing, government)
+    - Signals: domain-specific language, regulatory compliance, legacy systems
+    - Style: blend of technical + domain knowledge, reliability over novelty,
+             "how have you worked with legacy systems or compliance requirements?"
+
+  IF UNCLEAR -- default to Mid-Size Tech Company style.
+
+=================================================================
+ STEP 3 -- SKILL COVERAGE RULES
+=================================================================
+  MANDATORY SKILLS: Cover EVERY mandatory skill with at least one question.
+    These are non-negotiable. If the candidate lacks a mandatory skill, ask:
+    "This role requires [skill]. I don't see that in your background.
+     How would you approach learning it or handling that gap?"
+
+  NICE-TO-HAVE SKILLS: Ask about these ONLY if the candidate lists them on the resume.
+    Do NOT ask about nice-to-have skills the candidate has zero exposure to.
+
+=================================================================
+ STEP 4 -- QUESTION DISTRIBUTION (12-15 total)
+=================================================================
+  1. INTRO / BACKGROUND           1-2 questions  (calibrated to tier)
+  2. MANDATORY SKILL DEPTH        5-7 questions  (at least one per mandatory skill)
+  3. NICE-TO-HAVE EXPLORATION     2-3 questions  (only if candidate has these)
+  4. EXPERIENCE VERIFICATION      2-3 questions  (depth matched to tier + company type)
+  5. BEHAVIORAL / SITUATIONAL     1-2 questions  (STAR format, tier-appropriate stakes)
+  6. CLOSING                      1 question     ("What excites you about this role?")
+
+=================================================================
+ STYLE RULES
+=================================================================
+  - Sound like a human who has READ both documents
+  - Reference specific resume items: "I see you worked on X at Company Y..."
+  - Connect to the JD: "This role requires a lot of Z, so I would like to explore..."
+  - Scale complexity: Tier 1 gets "what/how" questions; Tier 4 gets "why/strategy" questions
+  - NO generic template questions like "What is your greatest weakness?"
+  - NO questions that are answered by simply reading the resume
+  - Generate EXACTLY 12-15 questions total — no more, no fewer
+"""
+
+
+# ----------------------------------------------------------
+#  Main generation function
+# ----------------------------------------------------------
 
 async def interview_question(
     resume_data: str,
     Job_Description: str,
     Experience: str,
     Mandatory_skills: str,
-    Nice_to_have_skills: str
-):
+    Nice_to_have_skills: str,
+) -> Question:
     """
-    Generate tailored interview questions based on resume, job description, and skill requirements.
+    Generate calibrated interview questions.
 
     Args:
-        resume_data: Candidate's resume text
-        Job_Description: Full job description
-        Experience: Required experience level (e.g., "4+ years", "Senior", "Mid-level")
-        Mandatory_skills: Skills that are required for the role
-        Nice_to_have_skills: Bonus skills that are preferred but not required
+        resume_data:         Full text of the candidate's resume
+        Job_Description:     Full text of the job description
+        Experience:          Experience requirement (e.g. "4+ years", "Senior", "0-1 year")
+        Mandatory_skills:    Comma/newline-separated required skills
+        Nice_to_have_skills: Comma/newline-separated preferred skills
+
+    Returns:
+        Question pydantic model containing a list of question objects
     """
-    agent = create_agent(model,
-            response_format=ToolStrategy(Question),
-            system_prompt=SYSTEM_PROMPT)
 
-    context_message = f"""USER INPUT:
+    # Calibration directives come FIRST so the LLM processes them at the
+    # highest priority before reading the content blocks below.
+    context_message = f"""
+CALIBRATION DIRECTIVES (read these before generating questions)
+================================================================
 
-JOB DESCRIPTION:
+EXPERIENCE LEVEL:
+{Experience.strip() if Experience.strip() else "Not explicitly provided -- infer from resume"}
+
+MANDATORY SKILLS (must cover every skill with at least one question):
+{Mandatory_skills.strip() if Mandatory_skills.strip() else "Not provided -- infer required skills from the JD below"}
+
+NICE-TO-HAVE SKILLS (ask only if the candidate lists these on their resume):
+{Nice_to_have_skills.strip() if Nice_to_have_skills.strip() else "Not provided -- skip this section"}
+
+Using the rules in your instructions:
+  1. Identify the EXPERIENCE TIER from the experience field above.
+  2. Infer the COMPANY TYPE from the job description below.
+  3. Generate 12-15 questions calibrated to BOTH the tier and company type.
+
+================================================================
+JOB DESCRIPTION
+================================================================
 {Job_Description}
 
-CANDIDATE EXPERIENCE LEVEL:
-{Experience}
-
-MANDATORY SKILLS (Must assess these thoroughly):
-{Mandatory_skills}
-
-NICE-TO-HAVE SKILLS (Explore if time permits/candidate has experience):
-{Nice_to_have_skills}
-
-CANDIDATE RESUME:
+================================================================
+CANDIDATE RESUME
+================================================================
 {resume_data}
 
-Please generate 12-15 tailored interview questions suitable for a 1-hour interview session.
-Prioritize assessment of MANDATORY SKILLS while covering all relevant aspects of the candidate's background."""
-    
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": context_message}]}
-    )
-    ans = result["structured_response"]
-    return ans
+================================================================
+REMINDER FOR YOUR OUTPUT
+================================================================
+- Generate exactly 12-15 interview questions.
+- Every mandatory skill listed above MUST appear in at least one question.
+- Calibrate complexity strictly to the experience tier and company type you identified.
+- Reference specific items from the resume and JD — do not ask generic questions.
+"""
 
-# if __name__ == "__main__":
-#     resume = """Jayanta Roy 
-# AI/ML Engineer — LLM & Multi-Agent Systems Specialist 
-# 8017021283 | jayantameslova@gmail.com | LinkedIn | GitHub | Kolkata, India 
-# PROFESSIONAL SUMMARY 
-# Results-driven AI/ML Engineer with 2+ years building production AI systems serving 10K+ users. Specialized in LLM applications, multi-agent 
-# architectures, and end-to-end ML pipelines using GPT-4, LangChain, and modern frameworks. Proven expertise delivering 95%+ model accuracy 
-# and 40% efficiency improvements through scalable solutions with FastAPI, AWS, and GPU infrastructure. 
-# EXPERIENCE 
-# AI/ML  Engineer 
-# Iksen India Pvt Ltd 
-# Jul 2024 – Present 
-# Kolkata, India 
-# • Architected AI Question Generation System using GPT-4O mini, OpenCV, and Swarm framework with AWS S3 integration, 
-# implementing pattern recognition and context-aware question generation following SDLC best practices. 
-# • Built production-grade Virtual Try-On AI platform using Fooocus model and FastAPI, deployed on RunPod GPU servers, 
-# generating photorealistic fashion visualizations with 95%+ accuracy for e-commerce applications. 
-# • Engineered end-to-end AI video generation pipeline integrating GPT-4O for scripting, Eleven Labs for voice synthesis, 
-# Stable Diffusion for image creation, and WAN 2.1 for animation, deployed on scalable RunPod infrastructure. 
-# • Developed enterprise recruitment intelligence platform with three specialized GPT-4o AI agents for resume parsing, JD analysis, 
-# and candidate matching, delivering 40% faster screening via FastAPI REST backend. 
-# • Created multi-agent Resume Maker Tool with GPT-4o-mini, aggregating data from LinkedIn, GitHub, and portfolios to 
-# generate ATS-optimized resumes with 95%+ compliance through async processing and structured JSON outputs. 
-# Machine Learning Engineer 
-# Paythrough Softwares and Solutions Pvt Ltd 
-# Jun 2023 – Jun 2024 
-# Kolkata, India 
-# • Deployed AI Financial Advisor Platform integrating LangChain, CrewAI, AutoGen agents with OpenAI-ada-002 
-# embeddings, Pinecone vector DB, IBM Watson transcription API, and Twilio REST API for real-time 
-# advisor-client communication. 
-# • Fine-tuned Mistral-7B on e-commerce FAQ dataset using PEFT with LoRA and Supervised Fine-tuning Trainer, achieving 30% 
-# improvement in query understanding and response accuracy for customer support automation. 
-# • Built production loan prediction and repayment models using SGD algorithm, NumPy, Pandas with comprehensive EDA and 
-# feature engineering, achieving 85%+ accuracy in credit risk assessment. 
-# • Designed dual-mode recommendation engine using SVD algorithm, delivering personalized product suggestions for 10K+ users 
-# with selection sort optimization for new and existing customer segments. 
-# TECHNICAL SKILLS 
-# Languages: Python, C/C++, SQL 
-# AI/ML Frameworks: LangChain, RAG, LangGraph, CrewAI, AutoGen, Swarm, Pydantic AI, MLOps, Scikit-Learn, TensorFlow, 
-# Keras, PyTorch 
-# LLM & Models: OpenAI GPT-4/4o, Gemini, DeepSeek, Anthropic Claude, Grok, Mistral, BERT, T5, Stable Diffusion, Hugging 
-# Face 
-# Databases: PostgreSQL, MySQL, Redis, Pinecone, FAISS, Chroma, Qdrant (Vector DBs) 
-# DevOps & Cloud: Docker, Git, AWS (SageMaker, EC2, Lambda, S3, LightSail), RunPod GPU Servers, CI/CD Pipelines 
-# APIs & Web: FastAPI, Flask, Quart, Django REST, RESTful APIs, OpenCV, Beautiful Soup 
-# ML Techniques: NLP, Computer Vision, Supervised/Unsupervised Learning, Feature Engineering, XGBoost, SGD, PEFT, LoRA, 
-# Model Fine-tuning 
-# EDUCATION 
-# Narula Institute of Technology (MAKAUT) 
-# Bachelor of Technology in Computer Science and Engineering; CGPA: 8.10/10.0 
-# South Calcutta Polytechnic (WBSCTE) 
-# Diploma in Computer Science and Technology; Percentage: 71.90% 
-# KEY ACHIEVEMENTS 
-# Kolkata, India 
-# Graduated 2023 
-# Kolkata, India 
-# Graduated 2020 
-# • Deployed 8+ production AI systems serving 10K+ users with 95%+ model accuracy and ATS compliance 
-# • Expertise in multi-agent AI architectures, LLM fine-tuning, and scalable ML pipeline development 
-# • Proficient in full-stack AI deployment: model training, API development, cloud infrastructure, and CI/CD automation """
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=context_message),
+    ]
 
-#     jd = """Job Title: Generative AI Engineer (Agentic AI)
-# Location: Hyderabad (Work from Office)
-# Experience: 4+ years
-# Employment Type: Full-Time
-
-
-# About the Role:
-
-# We are seeking a highly skilled Generative AI Engineer to design, develop, and deploy intelligent AI systems, including LLMs, Generative AI, and Agentic AI applications. The ideal candidate will work on cutting-edge projects, collaborate with cross-functional teams, and drive innovation in AI solutions leveraging AWS tools and modern AI frameworks.
-
-
-# Key Responsibilities:
-
-# Design, develop, and maintain Python-based applications and AI services.
-# Develop autonomous AI agents capable of reasoning, task execution, and multi-step decision-making.
-# Work with LLMs, Generative AI models, and integrate with AWS services like Lambda, Lex, SageMaker, and S3.
-# Collaborate with business and technical teams to understand requirements, propose solutions, and deliver high-quality implementations.
-# Research and implement the latest AI libraries, tools, and frameworks to enhance functionality and performance.
-# Troubleshoot, debug, and optimize applications and models for reliability and efficiency.
-# Write clean, maintainable, and well-tested code; contribute to CI/CD pipelines and GitHub version control.
-# Stay up-to-date with AI/ML trends, best practices, and Agentic AI developments.
-
-
-# Qualifications & Skills:
-
-# Bachelor’s degree in computer science, Engineering, or a related field.
-# 4+ years of hands-on Python development experience for AI or backend applications.
-# Strong experience with Generative AI, LLMs, and Agentic AI frameworks (LangChain, Llama Index, or similar).
-# Proficiency in data manipulation and analysis using Pandas, NumPy, and database integrations.
-# Knowledge of API integrations, multithreading, and structured programming.
-# Experience with AWS AI/ML services and cloud-native application deployment.
-# Familiarity with GitHub, CI/CD, and software development best practices.
-# Excellent problem-solving, analytical, and communication skills"""
-
-#     # Extract parameters from JD
-#     experience = "4+ years"
-
-#     mandatory_skills = """• 4+ years of hands-on Python development experience for AI or backend applications
-# • Strong experience with Generative AI, LLMs, and Agentic AI frameworks (LangChain, Llama Index, or similar)
-# • Proficiency in data manipulation and analysis using Pandas, NumPy, and database integrations
-# • Knowledge of API integrations, multithreading, and structured programming
-# • Experience with AWS AI/ML services (Lambda, Lex, SageMaker, S3) and cloud-native application deployment
-# • Bachelor's degree in Computer Science, Engineering, or related field"""
-
-#     nice_to_have_skills = """• CI/CD pipelines and GitHub
-# • Docker and containerization
-# • Vector databases (Pinecone, FAISS, Chroma)
-# • Additional cloud platforms beyond AWS
-# • MLOps practices and tools"""
-
-#     output = asyncio.run(interview_question(
-#         resume_data=resume,
-#         Job_Description=jd,
-#         Experience=experience,
-#         Mandatory_skills=mandatory_skills,
-#         Nice_to_have_skills=nice_to_have_skills
-#     ))
-#     print("=" * 60)
-#     print("INTERVIEW QUESTIONS (12-15 questions for 1 hour):")
-#     print("=" * 60)
-#     for i, q in enumerate(output.all_question, 1):
-#         print(f"\nQ{i}: {q.all_question}")
+    # Run the synchronous LangChain call in a thread pool executor so it does
+    # not block the FastAPI async event loop.
+    result: Question = await asyncio.to_thread(_structured_model.invoke, messages)
+    return result

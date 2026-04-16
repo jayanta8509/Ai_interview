@@ -6,5 +6,6 @@ temp_uploads
 test_transcript.txt
 .env
 env
+venv
 temp_uploads
 nohup uvicorn app:app --host 0.0.0.0 --port 8004 --workers 3 > app.log 2>&1 &

@@ -215,22 +215,26 @@ async def process_pdf_with_jd(
         min_length=1,
         max_length=10000
     ),
+    # FIX: Changed from required (...) with min_length=1 to Optional with defaults.
+    # Previously, if the Java backend omitted or sent empty strings for these fields,
+    # FastAPI returned a 422 validation error and NO questions were generated.
+    # Now the endpoint degrades gracefully: the LLM will infer experience/skills
+    # from the JD and resume when these are not provided.
     Experience: str = Form(
-        ...,
-        description="Experience text",
-        min_length=1,
+        default="",
+        description="Candidate experience level (e.g. '4+ years', 'Senior', 'Junior'). "
+                    "Optional — if empty, the LLM infers from the resume and JD.",
         max_length=10000
     ),
     Mandatory_skills: str = Form(
-        ...,
-        description="Mandatory skills text",
-        min_length=1,
+        default="",
+        description="Mandatory/required skills for the role. "
+                    "Optional — if empty, the LLM infers from the JD.",
         max_length=10000
     ),
     Nice_to_have_skills: str = Form(
-        ...,
-        description="Nice to have skills text",
-        min_length=1,
+        default="",
+        description="Preferred/bonus skills for the role. Optional.",
         max_length=10000
     ),
 ) -> ProcessPDFResponse:
@@ -239,8 +243,11 @@ async def process_pdf_with_jd(
 
     - **pdf_file**: PDF file upload (required)
     - **jd_text**: Job description as plain text (required, 1-10000 characters)
+    - **Experience**: Experience level (optional but highly recommended for calibration)
+    - **Mandatory_skills**: Required skills (optional but highly recommended for calibration)
+    - **Nice_to_have_skills**: Preferred skills (optional)
 
-    Returns processing status and metadata.
+    Returns processing status and metadata with calibrated interview questions.
     """
     try:
         validate_file_extension(pdf_file.filename, ALLOWED_PDF_EXTENSIONS)
@@ -249,10 +256,18 @@ async def process_pdf_with_jd(
         content = await pdf_file.read()
         file_size = len(content)
 
+        # FIX: Log the calibration context that will be used for question generation.
+        # This makes it easy to debug why questions are or are not well-calibrated.
         logger.info(
             f"Processing PDF: {pdf_file.filename}, "
             f"Size: {file_size} bytes, "
             f"JD length: {len(jd_text)} characters"
+        )
+        logger.info(
+            f"Calibration context — "
+            f"Experience: '{Experience or 'NOT PROVIDED (will infer)'}' | "
+            f"Mandatory skills: '{Mandatory_skills or 'NOT PROVIDED (will infer)'}' | "
+            f"Nice-to-have: '{Nice_to_have_skills or 'NOT PROVIDED (will skip)'}'"
         )
 
         temp_dir = "temp_uploads"
